@@ -5,163 +5,130 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
-import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigDecimal;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Test suite for {@link SubscriptionPricingService#calculateMonthlyPrice(SubscriptionTier, int, String)}.
+ * Contract for {@link SubscriptionPricingService#calculateMonthlyPrice(SubscriptionTier, int, String)}.
  *
- * Assumptions made explicit for the implementer (no production code is provided by this suite):
- * - Base monthly rates: BASIC = $50.00, PRO = $150.00, ENTERPRISE = $500.00.
- * - Longevity discount tiers are mutually exclusive (not stacked): activeMonths in (12, 36] -> 10% off;
- *   activeMonths > 36 -> 25% off; activeMonths <= 12 -> no discount.
- * - Voucher codes are case-sensitive and must not contain leading/trailing whitespace; anything that is
- *   not null/blank and not an exact match for a known code ("SAVE20", "HALFPRICE") throws InvalidVoucherException.
- * - A null or blank/empty voucher code is treated as "no voucher" and must NOT throw.
- * - SAVE20 subtracts a flat $20.00 from the rate AFTER the longevity discount has been applied.
- * - HALFPRICE multiplies the (longevity-discounted) rate by 0.5.
- * - A null tier throws NullPointerException; a negative activeMonths throws IllegalArgumentException.
- * - Returned BigDecimal values are monetary amounts scaled to 2 decimal places.
+ * <p>Base monthly rates: BASIC $50.00, PRO $150.00, ENTERPRISE $500.00.
+ *
+ * <p>Longevity tiers are mutually exclusive, never stacked:
+ * <ul>
+ *   <li>activeMonths &lt;= 12 -> full rate</li>
+ *   <li>12 &lt; activeMonths &lt;= 36 -> 10% off</li>
+ *   <li>activeMonths &gt; 36 -> 25% off</li>
+ * </ul>
+ *
+ * <p>Vouchers apply <em>after</em> the longevity discount. SAVE20 deducts a flat $20.00;
+ * HALFPRICE halves the rate. A null or blank code (empty, spaces, tabs) means "no voucher".
+ * Non-blank input is matched exactly and is never trimmed, so " SAVE20" is invalid, not SAVE20.
+ * An unrecognised non-blank code throws {@link InvalidVoucherException} whose message carries
+ * the rejected code. A null tier throws {@link NullPointerException} with the exact message
+ * "tier must not be null"; a negative activeMonths throws {@link IllegalArgumentException}
+ * whose message names the parameter.
+ *
+ * <p>Every expected amount below is an independently computed literal, never re-derived from the
+ * production rate table or multipliers, so a shared arithmetic misconception cannot hide.
+ * Amounts are asserted with {@code assertEquals} on {@link BigDecimal}, whose equality is
+ * scale-sensitive, pinning both the value and the 2-decimal monetary scale in one assertion.
+ *
+ * <p><strong>Known limits of this suite.</strong> Two parts of the contract are unobservable
+ * through the public API and are therefore specified but not asserted:
+ * <ul>
+ *   <li>HALFPRICE ordering. Multiplication commutes, so 50.00 x 0.90 x 0.50 equals
+ *       50.00 x 0.50 x 0.90. No input can distinguish the order. SAVE20 ordering <em>is</em>
+ *       decidable and is pinned by {@code save20AppliesAfterLongevityDiscount}.</li>
+ *   <li>Rounding mode. The fixed rates 50/150/500 against multipliers 0.90/0.75/0.50 land
+ *       exactly on a cent in every reachable case, so no input produces a sub-cent fraction.
+ *       Scale normalisation is asserted instead.</li>
+ * </ul>
+ * A negative result is likewise unreachable: the cheapest case is BASIC at 25% off less SAVE20,
+ * which floors at $17.50. No price-floor behaviour is specified because none can be triggered.
  */
 class SubscriptionPricingServiceTest {
 
     private final SubscriptionPricingService service = new SubscriptionPricingService();
 
-    private static void assertMoneyEquals(BigDecimal expected, BigDecimal actual) {
-        assertNotNull(actual, "Result must not be null");
-        assertEquals(0, expected.compareTo(actual),
-                () -> "Expected " + expected + " but was " + actual);
+    private static void assertMessageContains(Throwable thrown, String expectedFragment, String why) {
+        String message = String.valueOf(thrown.getMessage());
+        assertTrue(message.contains(expectedFragment),
+                () -> why + " - expected the message to contain \"" + expectedFragment
+                        + "\" but it was: " + message);
     }
 
-    // ---------------------------------------------------------------------
-    // Happy flow: base prices per tier, no discount, no voucher
-    // ---------------------------------------------------------------------
-    @Nested
-    @DisplayName("Base price happy flow (no discount, no voucher)")
-    class BasePriceTests {
-
-        @Test
-        @DisplayName("BASIC tier at <=12 months with no voucher returns $50.00")
-        void basicBasePrice() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 6, null);
-            assertMoneyEquals(new BigDecimal("50.00"), result);
-        }
-
-        @Test
-        @DisplayName("PRO tier at <=12 months with no voucher returns $150.00")
-        void proBasePrice() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.PRO, 6, null);
-            assertMoneyEquals(new BigDecimal("150.00"), result);
-        }
-
-        @Test
-        @DisplayName("ENTERPRISE tier at <=12 months with no voucher returns $500.00")
-        void enterpriseBasePrice() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.ENTERPRISE, 6, null);
-            assertMoneyEquals(new BigDecimal("500.00"), result);
-        }
-
-        @Test
-        @DisplayName("activeMonths = 0 (brand new account) applies no discount")
-        void zeroMonthsIsBasePrice() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 0, null);
-            assertMoneyEquals(new BigDecimal("50.00"), result);
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Longevity discount boundaries
-    // ---------------------------------------------------------------------
     @Nested
     @DisplayName("Longevity discount thresholds")
-    class LongevityDiscountTests {
+    class LongevityThresholds {
 
         @Test
-        @DisplayName("Exactly 12 months does NOT qualify for the 10% discount")
+        @DisplayName("12 months is not 'more than 12', so the full rate stands")
         void exactlyTwelveMonthsNoDiscount() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 12, null);
-            assertMoneyEquals(new BigDecimal("50.00"), result);
+            assertEquals(new BigDecimal("50.00"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 12, null));
         }
 
         @Test
-        @DisplayName("13 months qualifies for the 10% discount")
+        @DisplayName("13 months crosses the first threshold: 10% off")
         void thirteenMonthsGetsTenPercentOff() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 13, null);
-            assertMoneyEquals(new BigDecimal("45.00"), result);
+            assertEquals(new BigDecimal("45.00"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 13, null));
         }
 
         @Test
-        @DisplayName("Exactly 36 months only gets the 10% discount, not 25%")
+        @DisplayName("36 months is not 'more than 36', so it keeps 10% and does not reach 25%")
         void exactlyThirtySixMonthsGetsTenPercentOnly() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 36, null);
-            assertMoneyEquals(new BigDecimal("45.00"), result);
+            assertEquals(new BigDecimal("45.00"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 36, null));
         }
 
         @Test
-        @DisplayName("37 months qualifies for the 25% discount")
+        @DisplayName("37 months crosses the second threshold: 25% off")
         void thirtySevenMonthsGetsTwentyFivePercentOff() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 37, null);
-            assertMoneyEquals(new BigDecimal("37.50"), result);
+            assertEquals(new BigDecimal("37.50"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 37, null));
         }
 
-        @ParameterizedTest(name = "{0} tier at 13 months -> 10% off base rate")
-        @EnumSource(SubscriptionTier.class)
-        @DisplayName("10% longevity discount applies uniformly across all tiers")
-        void tenPercentDiscountAppliesToAllTiers(SubscriptionTier tier) {
-            BigDecimal base = basePriceOf(tier);
-            BigDecimal expected = base.multiply(new BigDecimal("0.90"));
-            BigDecimal result = service.calculateMonthlyPrice(tier, 13, null);
-            assertMoneyEquals(expected, result);
-        }
-
-        @ParameterizedTest(name = "{0} tier at 37 months -> 25% off base rate")
-        @EnumSource(SubscriptionTier.class)
-        @DisplayName("25% longevity discount applies uniformly across all tiers")
-        void twentyFivePercentDiscountAppliesToAllTiers(SubscriptionTier tier) {
-            BigDecimal base = basePriceOf(tier);
-            BigDecimal expected = base.multiply(new BigDecimal("0.75"));
-            BigDecimal result = service.calculateMonthlyPrice(tier, 37, null);
-            assertMoneyEquals(expected, result);
-        }
-
-        private BigDecimal basePriceOf(SubscriptionTier tier) {
-            return switch (tier) {
-                case BASIC -> new BigDecimal("50.00");
-                case PRO -> new BigDecimal("150.00");
-                case ENTERPRISE -> new BigDecimal("500.00");
-            };
+        @Test
+        @DisplayName("Discount tiers replace one another rather than stacking")
+        void tiersDoNotStack() {
+            // Stacking 10% then 25% would yield 33.75; the tiers are exclusive, so 25% alone wins.
+            assertEquals(new BigDecimal("37.50"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 48, null));
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Voucher + longevity discount combination matrix
-    // ---------------------------------------------------------------------
     @Nested
-    @DisplayName("Voucher and longevity discount combinations")
-    class VoucherCombinationTests {
+    @DisplayName("Price matrix: tier x longevity x voucher")
+    class PriceMatrix {
 
-        @ParameterizedTest(name = "{0} tier, {1} months, voucher=''{2}'' -> ${3}")
+        @ParameterizedTest(name = "{0}, {1} months, voucher={2} -> ${3}")
         @MethodSource("com.ai_tdd_assignment.tdd_assignment.pricing.SubscriptionPricingServiceTest#pricingMatrix")
-        @DisplayName("Full pricing matrix: tier x longevity tier x voucher")
-        void pricingMatrixIsCorrect(SubscriptionTier tier, int months, String voucherCode, BigDecimal expected) {
-            BigDecimal result = service.calculateMonthlyPrice(tier, months, voucherCode);
-            assertMoneyEquals(expected, result);
+        void resolvesExactAmount(SubscriptionTier tier, int months, String voucherCode, BigDecimal expected) {
+            assertEquals(expected, service.calculateMonthlyPrice(tier, months, voucherCode));
+        }
+
+        @Test
+        @DisplayName("SAVE20 is deducted after the longevity discount, not before")
+        void save20AppliesAfterLongevityDiscount() {
+            // The discriminating case: (50.00 x 0.90) - 20.00 = 25.00, whereas deducting first
+            // would give (50.00 - 20.00) x 0.90 = 27.00. This is the only ordering the API exposes.
+            assertEquals(new BigDecimal("25.00"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 13, "SAVE20"));
         }
     }
 
     static Stream<Arguments> pricingMatrix() {
         return Stream.of(
-                // ---- BASIC ($50.00 base) ----
+                // BASIC, $50.00 base
                 Arguments.of(SubscriptionTier.BASIC, 0, null, new BigDecimal("50.00")),
                 Arguments.of(SubscriptionTier.BASIC, 0, "SAVE20", new BigDecimal("30.00")),
                 Arguments.of(SubscriptionTier.BASIC, 0, "HALFPRICE", new BigDecimal("25.00")),
@@ -172,7 +139,7 @@ class SubscriptionPricingServiceTest {
                 Arguments.of(SubscriptionTier.BASIC, 37, "SAVE20", new BigDecimal("17.50")),
                 Arguments.of(SubscriptionTier.BASIC, 37, "HALFPRICE", new BigDecimal("18.75")),
 
-                // ---- PRO ($150.00 base) ----
+                // PRO, $150.00 base
                 Arguments.of(SubscriptionTier.PRO, 0, null, new BigDecimal("150.00")),
                 Arguments.of(SubscriptionTier.PRO, 0, "SAVE20", new BigDecimal("130.00")),
                 Arguments.of(SubscriptionTier.PRO, 0, "HALFPRICE", new BigDecimal("75.00")),
@@ -183,7 +150,7 @@ class SubscriptionPricingServiceTest {
                 Arguments.of(SubscriptionTier.PRO, 37, "SAVE20", new BigDecimal("92.50")),
                 Arguments.of(SubscriptionTier.PRO, 37, "HALFPRICE", new BigDecimal("56.25")),
 
-                // ---- ENTERPRISE ($500.00 base) ----
+                // ENTERPRISE, $500.00 base
                 Arguments.of(SubscriptionTier.ENTERPRISE, 0, null, new BigDecimal("500.00")),
                 Arguments.of(SubscriptionTier.ENTERPRISE, 0, "SAVE20", new BigDecimal("480.00")),
                 Arguments.of(SubscriptionTier.ENTERPRISE, 0, "HALFPRICE", new BigDecimal("250.00")),
@@ -196,86 +163,107 @@ class SubscriptionPricingServiceTest {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Null / blank voucher handling (must NOT throw)
-    // ---------------------------------------------------------------------
     @Nested
-    @DisplayName("Null and blank voucher codes are treated as 'no voucher'")
-    class NullAndBlankVoucherTests {
+    @DisplayName("Blank voucher codes mean 'no voucher'")
+    class BlankVoucherCodes {
 
-        @ParameterizedTest
-        @NullAndEmptySource
-        @DisplayName("null and empty voucher codes do not throw and apply no voucher discount")
-        void nullOrEmptyVoucherAppliesNoDiscount(String voucherCode) {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 13, voucherCode);
-            assertMoneyEquals(new BigDecimal("45.00"), result);
+        @ParameterizedTest(name = "voucher={0} leaves the longevity-discounted rate untouched")
+        @NullSource
+        @ValueSource(strings = {"", " ", "   ", "\t"})
+        void blankVoucherIsIgnored(String voucherCode) {
+            assertEquals(new BigDecimal("45.00"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, 13, voucherCode));
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Invalid input handling
-    // ---------------------------------------------------------------------
     @Nested
-    @DisplayName("Invalid input handling")
-    class InvalidInputTests {
+    @DisplayName("Error contracts")
+    class ErrorContracts {
 
         @Test
-        @DisplayName("null tier throws NullPointerException")
-        void nullTierThrowsNullPointerException() {
-            assertThrows(NullPointerException.class,
+        @DisplayName("Null tier fails on a deliberate guard, not an incidental dereference")
+        void nullTierThrowsGuardedNpe() {
+            NullPointerException thrown = assertThrows(NullPointerException.class,
                     () -> service.calculateMonthlyPrice(null, 5, null));
+
+            // Must be exact, not a "contains" check: an unguarded dereference also throws NPE, and
+            // the JVM's helpful message ("... because \"tier\" is null") would satisfy any looser
+            // assertion. Only the exact string proves a deliberate requireNonNull was written.
+            assertEquals("tier must not be null", thrown.getMessage());
         }
 
-        @Test
-        @DisplayName("negative activeMonths throws IllegalArgumentException")
-        void negativeActiveMonthsThrowsIllegalArgumentException() {
-            assertThrows(IllegalArgumentException.class,
-                    () -> service.calculateMonthlyPrice(SubscriptionTier.BASIC, -1, null));
+        @ParameterizedTest(name = "activeMonths={0} is rejected")
+        @ValueSource(ints = {-1, -13, Integer.MIN_VALUE})
+        void negativeMonthsRejected(int activeMonths) {
+            IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                    () -> service.calculateMonthlyPrice(SubscriptionTier.BASIC, activeMonths, null));
+
+            assertMessageContains(thrown, "activeMonths",
+                    "A negative tenure must be rejected with a message naming the parameter");
         }
 
-        @ParameterizedTest
-        @ValueSource(strings = {"FAKE10", "save20", "halfprice", "SAVE-20", "SAVE20 ", " SAVE20", "20SAVE"})
-        @DisplayName("Unknown or malformed voucher codes throw InvalidVoucherException")
-        void malformedOrUnknownVoucherThrowsInvalidVoucherException(String voucherCode) {
-            assertThrows(InvalidVoucherException.class,
+        @ParameterizedTest(name = "unrecognised code {0} is rejected")
+        @ValueSource(strings = {"FAKE10", "20SAVE", "SAVE-20", "DISCOUNT"})
+        void unknownCodeIsRejected(String voucherCode) {
+            assertRejectedVoucher(voucherCode);
+        }
+
+        @ParameterizedTest(name = "wrong-case code {0} is rejected")
+        @ValueSource(strings = {"save20", "Save20", "halfprice", "HalfPrice"})
+        void voucherMatchingIsCaseSensitive(String voucherCode) {
+            assertRejectedVoucher(voucherCode);
+        }
+
+        @ParameterizedTest(name = "padded code {0} is rejected rather than trimmed")
+        @ValueSource(strings = {" SAVE20", "SAVE20 ", " HALFPRICE ", "\tSAVE20"})
+        void paddedCodeIsNotTrimmed(String voucherCode) {
+            assertRejectedVoucher(voucherCode);
+        }
+
+        private void assertRejectedVoucher(String voucherCode) {
+            InvalidVoucherException thrown = assertThrows(InvalidVoucherException.class,
                     () -> service.calculateMonthlyPrice(SubscriptionTier.BASIC, 5, voucherCode));
+
+            assertMessageContains(thrown, voucherCode,
+                    "A rejected voucher must surface the offending code for log diagnosis");
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Boundary / precision assertions
-    // ---------------------------------------------------------------------
     @Nested
-    @DisplayName("Boundary and precision assertions")
-    class BoundaryAndPrecisionTests {
+    @DisplayName("Bounds and precision")
+    class BoundsAndPrecision {
 
         @Test
-        @DisplayName("Integer.MAX_VALUE months does not overflow and applies the 25% longevity tier")
-        void maxIntMonthsAppliesTopLongevityTierWithoutOverflow() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, Integer.MAX_VALUE, null);
-            assertMoneyEquals(new BigDecimal("37.50"), result);
+        @DisplayName("Integer.MAX_VALUE months resolves to the 25% tier without overflowing")
+        void maxIntMonthsAppliesTopTier() {
+            assertEquals(new BigDecimal("37.50"),
+                    service.calculateMonthlyPrice(SubscriptionTier.BASIC, Integer.MAX_VALUE, null));
         }
 
         @Test
-        @DisplayName("Integer.MAX_VALUE months combined with HALFPRICE voucher resolves correctly")
-        void maxIntMonthsWithHalfPriceVoucher() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.ENTERPRISE, Integer.MAX_VALUE, "HALFPRICE");
-            assertMoneyEquals(new BigDecimal("187.50"), result);
+        @DisplayName("Integer.MAX_VALUE months combines with HALFPRICE without overflowing")
+        void maxIntMonthsWithHalfPrice() {
+            assertEquals(new BigDecimal("187.50"),
+                    service.calculateMonthlyPrice(SubscriptionTier.ENTERPRISE, Integer.MAX_VALUE, "HALFPRICE"));
         }
 
         @Test
-        @DisplayName("Returned monetary amount is scaled to exactly 2 decimal places")
-        void resultIsScaledToTwoDecimalPlaces() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.PRO, 37, "HALFPRICE");
-            assertEquals(2, result.scale(), () -> "Expected scale 2 but was " + result.scale());
+        @DisplayName("A whole-dollar amount is returned as 50.00, never as 50 or 50.0")
+        void wholeDollarAmountKeepsTwoDecimalScale() {
+            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 6, null);
+
+            assertEquals("50.00", result.toPlainString());
+            assertEquals(2, result.scale());
         }
 
         @Test
-        @DisplayName("SAVE20 on the lowest tier with maximum discount never produces a negative price")
-        void save20NeverProducesNegativePrice() {
-            BigDecimal result = service.calculateMonthlyPrice(SubscriptionTier.BASIC, 37, "SAVE20");
-            assertTrue(result.compareTo(BigDecimal.ZERO) >= 0,
-                    () -> "Price must never be negative but was " + result);
+        @DisplayName("Repeated invocation with identical arguments yields an identical result")
+        void repeatedInvocationYieldsIdenticalResult() {
+            BigDecimal first = service.calculateMonthlyPrice(SubscriptionTier.PRO, 37, "SAVE20");
+            BigDecimal second = service.calculateMonthlyPrice(SubscriptionTier.PRO, 37, "SAVE20");
+
+            assertEquals(new BigDecimal("92.50"), first);
+            assertEquals(first, second);
         }
     }
 }
